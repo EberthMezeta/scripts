@@ -176,6 +176,23 @@ command -v steam &>/dev/null || sudo apt install -y steam
 command -v copyq &>/dev/null || sudo apt install -y copyq
 
 # ===============================
+# Instalar KDE Connect
+# ===============================
+command -v kdeconnectd &>/dev/null || sudo apt update && sudo apt install -y kdeconnect
+
+# ===============================
+# Instalar bat
+# ===============================
+command -v bat &>/dev/null || {
+  sudo apt install -y bat
+  # Configurar alias si el binario se llama batcat
+  if command -v batcat &>/dev/null; then
+    echo "alias bat='batcat'" >>~/.zshrc
+    source ~/.zshrc
+  fi
+}
+
+# ===============================
 # Configurar .zshrc
 # ===============================
 cat >~/.zshrc <<'EOF'
