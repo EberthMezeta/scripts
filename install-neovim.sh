@@ -7,7 +7,7 @@
 # Coloca:
 #   $PREFIX/bin/nvim                          (symlink al tarball en $PREFIX/opt)
 #   $PREFIX/bin/nvim-setup                    (copia de este script: --update / --config-only)
-#   $PREFIX/bin/{lazygit,lazydocker,rg,fd}    (si faltaban; binarios sin sudo)
+#   $PREFIX/bin/{lazygit,lazydocker,rg,fd,tree-sitter} (si faltaban; binarios sin sudo)
 #   ~/.config/nvim-shared/                    BASE compartida (plugins agnósticos al stack)
 #   ~/.config/nvim/                           perfil "default" (generalista) = base
 #   ~/.config/nvim-ruby/                      perfil Ruby/Rails  = base + dedicados
@@ -82,7 +82,15 @@ case "$(uname -m)" in
 esac
 
 # node/npm en PATH para los instaladores headless de Mason (nvm no siempre exporta)
-[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 || true
+# nvm.sh no tolera 'set -u' (aborta a medio cargar), así que se desactiva al cargarlo
+if [ -s "$HOME/.nvm/nvm.sh" ]; then
+  set +u; . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1 || true; set -u
+fi
+# respaldo: si aun así no hay node, usar la versión más nueva instalada por nvm
+if ! command -v node >/dev/null 2>&1 && [ -d "$HOME/.nvm/versions/node" ]; then
+  _nvm_node="$(ls -d "$HOME"/.nvm/versions/node/v*/bin 2>/dev/null | sort -V | tail -n1)"
+  [ -n "$_nvm_node" ] && export PATH="$_nvm_node:$PATH"
+fi
 if command -v node >/dev/null 2>&1; then
   NODE_BIN="$(cd "$(dirname "$(command -v node)")" && pwd)"
   export PATH="$NODE_BIN:$PATH"
@@ -215,9 +223,14 @@ install_gh_tool() { # <bin> <repo> <asset_prefix>
   fi
   ver="${tag#v}"
   case "$ARCH" in x86_64) aarch=x86_64 ;; arm64) aarch=arm64 ;; esac
-  curl -fL --retry 3 -o "$TMP/$name.tgz" \
-    "https://github.com/$repo/releases/download/$tag/${pref}_${ver}_Linux_${aarch}.tar.gz" \
-    || { log "⚠  fallo la descarga de $name"; return 0; }
+  # lazygit usa 'linux' en minúsculas desde ~v0.5x; lazydocker sigue con 'Linux'
+  local os ok=0
+  for os in Linux linux; do
+    curl -fsL --retry 3 -o "$TMP/$name.tgz" \
+      "https://github.com/$repo/releases/download/$tag/${pref}_${ver}_${os}_${aarch}.tar.gz" \
+      && { ok=1; break; }
+  done
+  [ "$ok" = 1 ] || { log "⚠  fallo la descarga de $name"; return 0; }
   tar -C "$BIN" -xzf "$TMP/$name.tgz" "$name"
   chmod +x "$BIN/$name"
   log "$name $ver -> $BIN/$name"
@@ -242,20 +255,40 @@ install_ripgrep() {
   [ -n "$rb" ] && install -m755 "$rb" "$BIN/rg" && log "ripgrep $ver -> $BIN/rg"
 }
 
+install_tree_sitter_cli() {
+  # nvim-treesitter (rama main) compila los parsers con tree-sitter-cli >= 0.26.1.
+  # apt trae 0.20.x, así que se baja el binario oficial.
+  local cur
+  cur="$(tree-sitter --version 2>/dev/null | awk '{print $2}')"
+  if [ -n "$cur" ] && [ "$(printf '%s\n' 0.26.1 "$cur" | sort -V | head -n1)" = 0.26.1 ]; then
+    log "tree-sitter $cur ok"; return 0
+  fi
+  local a; case "$ARCH" in x86_64) a=x64 ;; arm64) a=arm64 ;; esac
+  curl -fL --retry 3 -o "$TMP/ts.gz" \
+    "https://github.com/tree-sitter/tree-sitter/releases/latest/download/tree-sitter-linux-${a}.gz" \
+    || { log "⚠  fallo la descarga de tree-sitter-cli (los parsers no se podrán compilar)"; return 0; }
+  gunzip -c "$TMP/ts.gz" > "$BIN/tree-sitter" && chmod +x "$BIN/tree-sitter"
+  log "$("$BIN/tree-sitter" --version) -> $BIN/tree-sitter"
+}
+
 install_extras() {
   step "Dependencias externas"
+  install_tree_sitter_cli
   if ! have fd; then
     if have fdfind; then ln -sf "$(command -v fdfind)" "$BIN/fd"; log "fd -> fdfind (symlink)"; fi
   else log "fd ok"; fi
   have rg || install_ripgrep
   have rg && log "ripgrep ok"
-  if ! have ctags; then
+  local apt_pkgs=()
+  have ctags || apt_pkgs+=(universal-ctags)
+  [ "${XDG_SESSION_TYPE:-}" = wayland ] && ! have wl-copy && apt_pkgs+=(wl-clipboard)
+  if [ "${#apt_pkgs[@]}" -gt 0 ]; then
     if sudo -n true 2>/dev/null; then
-      sudo apt-get update -qq && sudo apt-get install -y universal-ctags && log "universal-ctags instalado"
+      sudo apt-get update -qq && sudo apt-get install -y "${apt_pkgs[@]}" && log "${apt_pkgs[*]} instalado(s)"
     else
-      log "⚠  ejecuta a mano:  sudo apt install universal-ctags   (lo usa gutentags)"
+      log "⚠  ejecuta a mano:  sudo apt install ${apt_pkgs[*]}"
     fi
-  else log "ctags ok"; fi
+  else log "ctags / portapapeles ok"; fi
   have node && log "node $(node -v) ok" \
     || log "⚠  node/npm no en PATH (nvm): necesario para algunos LSP y markdown-preview"
 }
@@ -305,6 +338,13 @@ o.smartindent = true
 o.wrap = false
 o.confirm = true
 pcall(function() o.winborder = "rounded" end) -- 0.11+
+
+-- proveedores remotos: ningún plugin de esta config los usa (todo es Lua);
+-- desactivarlos acelera el arranque y limpia :checkhealth
+vim.g.loaded_python3_provider = 0
+vim.g.loaded_ruby_provider = 0
+vim.g.loaded_perl_provider = 0
+vim.g.loaded_node_provider = 0
 EOF
 
   wf "$SHARED/lua/base/keymaps.lua" <<'EOF'
@@ -398,6 +438,7 @@ function M.setup(profile)
   require("lazy").setup(specs, {
     lockfile = vim.fn.stdpath("config") .. "/lazy-lock.json",
     change_detection = { notify = false },
+    rocks = { enabled = false }, -- ningún plugin necesita luarocks
     install = { colorscheme = { "onedark_vivid", "habamax" } },
     ui = { border = "rounded" },
     performance = { rtp = { disabled_plugins = { "gzip", "tarPlugin", "zipPlugin", "netrwPlugin" } } },
@@ -453,7 +494,7 @@ return {
       filtered_items = { visible = true, hide_dotfiles = false, hide_gitignored = false } } } },
 
   -- Fuzzy finder
-  { "nvim-telescope/telescope.nvim", branch = "0.1.x",
+  { "nvim-telescope/telescope.nvim", version = "*",
     dependencies = {
       "nvim-lua/plenary.nvim",
       { "nvim-telescope/telescope-fzf-native.nvim", build = "make" },
@@ -538,48 +579,54 @@ return {
 EOF
 
   wf "$SHARED/lua/base/plugins/treesitter.lua" <<'EOF'
+-- nvim-treesitter rama 'main' (la 'master' está congelada y no soporta nvim 0.12).
+-- Requiere tree-sitter-cli >= 0.26.1 (lo instala el script en ~/.local/bin).
 local ensure = {
   "lua", "vim", "vimdoc", "query", "bash", "regex",
-  "markdown", "markdown_inline", "json", "jsonc", "yaml", "toml",
+  "markdown", "markdown_inline", "json", "yaml", "toml",
   "html", "css", "scss", "javascript", "typescript", "tsx",
   "sql", "dockerfile", "gitcommit", "gitignore", "git_rebase", "diff",
 }
 vim.list_extend(ensure, (_G.PROFILE or {}).treesitter or {}) -- parsers del perfil
+_G.TS_ENSURE = ensure -- lo usa el sync headless de install-neovim.sh
 
 return {
-  { "nvim-treesitter/nvim-treesitter", branch = "master", build = ":TSUpdate",
-    event = { "BufReadPost", "BufNewFile" },
-    main = "nvim-treesitter.configs",
-    dependencies = { "RRethy/nvim-treesitter-endwise" },
-    opts = {
-      ensure_installed = ensure,
-      auto_install = false,
-      highlight = { enable = true },
-      indent = { enable = true },
-      endwise = { enable = true },
-      incremental_selection = { enable = true, keymaps = {
-        init_selection = "<C-space>", node_incremental = "<C-space>",
-        node_decremental = "<bs>", scope_incremental = false,
-      } },
-    } },
+  { "nvim-treesitter/nvim-treesitter", branch = "main", lazy = false, build = ":TSUpdate",
+    config = function()
+      local ts = require("nvim-treesitter")
+      -- en headless el script instala y espera; con UI se instala en segundo plano
+      if #vim.api.nvim_list_uis() > 0 then ts.install(ensure) end
+
+      vim.api.nvim_create_autocmd("FileType", {
+        group = vim.api.nvim_create_augroup("base-treesitter", { clear = true }),
+        callback = function(ev)
+          local lang = vim.treesitter.language.get_lang(ev.match)
+          if not (lang and pcall(vim.treesitter.start, ev.buf, lang)) then return end
+          vim.bo[ev.buf].indentexpr = "v:lua.require'nvim-treesitter'.indentexpr()"
+        end,
+      })
+    end },
+
+  -- cierra def/if/do … con 'end' (Ruby, Lua, Bash…); ya no depende de los módulos de master
+  { "RRethy/nvim-treesitter-endwise", event = "InsertEnter" },
 }
 EOF
 
   wf "$SHARED/lua/base/plugins/lsp.lua" <<'EOF'
 return {
-  { "williamboman/mason.nvim", build = ":MasonUpdate", cmd = "Mason",
+  { "mason-org/mason.nvim", build = ":MasonUpdate", cmd = "Mason",
     opts = {
       ui = { border = "rounded" },
       -- un solo Mason para todos los perfiles: se instala una vez y se reutiliza
       install_root_dir = vim.fn.expand("~/.local/share/nvim/mason"),
     } },
-  { "WhoIsSethDaniel/mason-tool-installer.nvim", dependencies = "williamboman/mason.nvim" },
+  { "WhoIsSethDaniel/mason-tool-installer.nvim", dependencies = "mason-org/mason.nvim" },
 
   { "neovim/nvim-lspconfig",
     event = { "BufReadPre", "BufNewFile" },
     dependencies = {
-      "williamboman/mason.nvim",
-      "williamboman/mason-lspconfig.nvim",
+      "mason-org/mason.nvim",
+      "mason-org/mason-lspconfig.nvim",
       "WhoIsSethDaniel/mason-tool-installer.nvim",
       "saghen/blink.cmp",
     },
@@ -629,14 +676,8 @@ return {
           m("<leader>rn", vim.lsp.buf.rename, "renombrar")
           m("<leader>ca", vim.lsp.buf.code_action, "code action")
           m("<leader>cd", vim.diagnostic.open_float, "ver diagnóstico")
-          local goto_prev = vim.diagnostic.goto_prev
-          local goto_next = vim.diagnostic.goto_next
-          m("[d", function()
-            if vim.diagnostic.jump then vim.diagnostic.jump({ count = -1, float = true }) else goto_prev() end
-          end, "diag. anterior")
-          m("]d", function()
-            if vim.diagnostic.jump then vim.diagnostic.jump({ count = 1, float = true }) else goto_next() end
-          end, "diag. siguiente")
+          m("[d", function() vim.diagnostic.jump({ count = -1, float = true }) end, "diag. anterior")
+          m("]d", function() vim.diagnostic.jump({ count = 1, float = true }) end, "diag. siguiente")
         end,
       })
 
@@ -1035,6 +1076,9 @@ sync_profile() { # <appname|"">
   [ -n "$app" ] && env=(env NVIM_APPNAME="$app")
   # 1) clona/actualiza plugins + compila parsers de Treesitter
   timeout 900 "${env[@]}" "$BIN/nvim" --headless "+Lazy! sync" +qa 2>&1 | tail -n 8 || true
+  # 1b) parsers de Treesitter (rama main: install() es asíncrono, aquí se espera)
+  timeout 900 "${env[@]}" "$BIN/nvim" --headless \
+    -c 'lua require("nvim-treesitter").install(_G.TS_ENSURE or {}):wait(840000)' +qa 2>&1 | tail -n 5 || true
   # 2) instala servidores LSP + formateadores (abre un buffer real para cargar lspconfig;
   #    sale solo al terminar Mason, con tope de 12 min por si algo se cuelga)
   timeout 780 "${env[@]}" "$BIN/nvim" --headless "$SHARED/lua/base/options.lua" \
@@ -1078,8 +1122,12 @@ self_install
 
 if [ "$DO_SYNC" = 1 ]; then
   sync_profile ""
-  sync_profile "nvim-ruby"
-  sync_profile "nvim-rust"
+  # los perfiles de lenguaje solo se sincronizan si su toolchain está instalado;
+  # si no, se instalan solos la primera vez que abras nvim-ruby / nvim-rust
+  if have ruby || have bundle; then sync_profile "nvim-ruby"
+  else step "Perfil ruby: sin Ruby instalado, se omite el sync"; fi
+  if have cargo; then sync_profile "nvim-rust"
+  else step "Perfil rust: sin cargo instalado, se omite el sync"; fi
 fi
 
 step "Hecho"
