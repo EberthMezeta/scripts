@@ -443,8 +443,10 @@ configure_zshrc() {
 
   # FIX: if/fi en vez de [[ ]] && para evitar set -e cuando rvm_ruby=off
   local plugins="git zsh-syntax-highlighting zsh-autosuggestions"
-  if [[ "${SELECTIONS[rvm_ruby]:-off}" == "on" ]]; then
-    plugins="$plugins rails git-flow"
+  # Plugins Ruby/Rails si se va a instalar RVM en esta corrida O si ya está instalado
+  # (antes solo miraba la selección, así que un .zshrc regenerado los perdía)
+  if [[ "${SELECTIONS[rvm_ruby]:-off}" == "on" ]] || [[ -s "/etc/profile.d/rvm.sh" ]] || command -v rvm &>/dev/null; then
+    plugins="$plugins rvm ruby rails bundler gem git-flow"
   fi
 
   cat > "$HOME/.zshrc" <<ZSHRC
