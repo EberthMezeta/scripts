@@ -69,7 +69,7 @@ cat > "$BIN_TARGET" <<'MYSQL_IMPORT_SCRIPT_EOF'
 # Docs completas:  ~/.local/share/doc/mysql-import/README.md   (o  mysql-import --help)
 #
 set -euo pipefail
-VERSION=1.1.0
+VERSION=1.2.0
 SELF=${0##*/}
 
 # ------------------------------------------------------------------ config files
@@ -88,6 +88,7 @@ PW="${MYSQL_IMPORT_PASSWORD:-}"
 CHARSET="${MYSQL_IMPORT_CHARSET:-utf8mb4}"
 COLLATION="${MYSQL_IMPORT_COLLATION:-utf8mb4_unicode_ci}"
 CLIENT="${MYSQL_IMPORT_CLIENT:-}"          # binario cliente (native): mysql | mariadb
+MAX_PACKET="${MYSQL_IMPORT_MAX_PACKET:-1G}" # max_allowed_packet para la importacion (servidor y cliente)
 DROP=0 ASSUME_YES=0 NO_GUI=0 LIST_ONLY=0 FORCE_STREAM=0
 SRC="" DB=""
 
@@ -113,6 +114,7 @@ OPCIONES
   -p, --password PASS   password (o se lee del contenedor / se pregunta)
   --charset NOMBRE      charset al crear la BD             (def: $CHARSET)
   --collation NOMBRE    collation al crear la BD           (def: $COLLATION)
+  --max-packet TAM      max_allowed_packet al importar     (def: $MAX_PACKET; max 1G)
   -h, --help            esta ayuda
   -V, --version         version
 
@@ -127,7 +129,7 @@ CONFIG (env o archivos KEY=value, en este orden)
   \${XDG_CONFIG_HOME:-~/.config}/mysql-import.env
   ./.mysql-import.env
   Variables: MYSQL_IMPORT_MODE, _CONTAINER, _HOST, _PORT, _USER, _PASSWORD,
-             _CHARSET, _COLLATION, _CLIENT
+             _CHARSET, _COLLATION, _CLIENT, _MAX_PACKET
 
 EJEMPLOS
   $SELF dump.sql
@@ -153,6 +155,7 @@ while [ $# -gt 0 ]; do
     -p|--password) PW="$2"; shift ;;
     --charset) CHARSET="$2"; shift ;;
     --collation) COLLATION="$2"; shift ;;
+    --max-packet) MAX_PACKET="$2"; shift ;;
     -h|--help) usage; exit 0 ;;
     -V|--version) echo "$SELF $VERSION"; exit 0 ;;
     --) shift; break ;;
@@ -315,14 +318,49 @@ fi
 step "CREATE DATABASE IF NOT EXISTS \`$DB\` ($CHARSET / $COLLATION)"
 sql "CREATE DATABASE IF NOT EXISTS \`$DB\` CHARACTER SET $CHARSET COLLATE $COLLATION"
 
+# ------------------------------------------------------------------ max_allowed_packet
+# Los dumps con extended-insert traen INSERTs de varios MB en una sola linea; si superan
+# max_allowed_packet (MySQL 5.7 trae 4M) el servidor corta: "MySQL server has gone away".
+# Se sube en el servidor (GLOBAL, aplica a conexiones nuevas, dura hasta reiniciarlo)
+# y en el cliente que hace la importacion.
+to_bytes() {
+  local v; v=$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')
+  case "$v" in
+    *G) echo $(( ${v%G} * 1073741824 )) ;;
+    *M) echo $(( ${v%M} * 1048576 )) ;;
+    *K) echo $(( ${v%K} * 1024 )) ;;
+    *)  echo "$v" ;;
+  esac
+}
+PKT_BYTES=$(to_bytes "$MAX_PACKET")
+[ "$PKT_BYTES" -gt 1073741824 ] && PKT_BYTES=1073741824   # tope de MySQL
+CUR_PKT=$(sql "SELECT @@global.max_allowed_packet" 2>/dev/null || echo 0)
+if [ "${CUR_PKT:-0}" -lt "$PKT_BYTES" ]; then
+  if sql "SET GLOBAL max_allowed_packet=$PKT_BYTES" 2>/dev/null; then
+    step "max_allowed_packet del servidor: $((CUR_PKT / 1048576))M → $((PKT_BYTES / 1048576))M (hasta reiniciar el servidor)"
+  else
+    step "Aviso: no pude subir max_allowed_packet (actual $((CUR_PKT / 1048576))M, falta privilegio SUPER); INSERTs grandes pueden fallar"
+  fi
+fi
+# Timeouts de red: con INSERTs enormes el servidor puede cortar por net_read/write_timeout
+# (30s/60s por defecto). Se suben a NET_TIMEOUT si estan por debajo.
+NET_TIMEOUT="${MYSQL_IMPORT_NET_TIMEOUT:-3600}"
+CUR_NRT=$(sql "SELECT LEAST(@@global.net_read_timeout, @@global.net_write_timeout)" 2>/dev/null || echo 0)
+if [ "${CUR_NRT:-0}" -lt "$NET_TIMEOUT" ]; then
+  sql "SET GLOBAL net_read_timeout=$NET_TIMEOUT, net_write_timeout=$NET_TIMEOUT" 2>/dev/null \
+    && step "net_read/write_timeout del servidor: ${CUR_NRT}s → ${NET_TIMEOUT}s (hasta reiniciar el servidor)" \
+    || step "Aviso: no pude subir net_read/write_timeout (actual ${CUR_NRT}s)"
+fi
+IMPORTC=("${MYSQLC[@]}" "--max-allowed-packet=$PKT_BYTES")
+
 SIZE=$(du -h "$SRC" | cut -f1)
 run_import() {
   if [ "$GZ" = 1 ]; then
     step "Importando (stream gunzip)  $SRC  [$SIZE]  →  $DB"
-    gunzip -c "$SRC" | "${MYSQLC[@]}" "$DB"
+    gunzip -c "$SRC" | "${IMPORTC[@]}" "$DB"
   elif [ "$FORCE_STREAM" = 1 ]; then
     step "Importando (stream)  $SRC  [$SIZE]  →  $DB"
-    "${MYSQLC[@]}" "$DB" < "$SRC"
+    "${IMPORTC[@]}" "$DB" < "$SRC"
   elif [ "$MODE" = docker ]; then
     local tmp="/tmp/$SELF.$$.sql"
     step "docker cp  →  $CONTAINER:$tmp  [$SIZE]"
@@ -330,10 +368,10 @@ run_import() {
     # shellcheck disable=SC2064
     trap "docker exec '$CONTAINER' rm -f '$tmp' >/dev/null 2>&1 || true" EXIT
     step "SOURCE $tmp  →  $DB"
-    "${MYSQLC[@]}" "$DB" -e "source $tmp"
+    "${IMPORTC[@]}" "$DB" -e "source $tmp"
   else
     step "SOURCE $SRC  →  $DB"
-    "${MYSQLC[@]}" "$DB" -e "source $SRC"
+    "${IMPORTC[@]}" "$DB" -e "source $SRC"
   fi
 }
 
@@ -436,6 +474,7 @@ como argumento, trabaja en la terminal.
 | `-p`, `--password PASS` | Password (si no, se lee del contenedor o se pregunta). |
 | `--charset NOMBRE` | Charset al crear la BD (def. `utf8mb4`). |
 | `--collation NOMBRE` | Collation al crear la BD (def. `utf8mb4_unicode_ci`). |
+| `--max-packet TAM` | `max_allowed_packet` para importar, en servidor y cliente (def. `1G`, que es el tope de MySQL). |
 | `-h`, `--help` / `-V`, `--version` | Ayuda / versión. |
 
 Argumentos posicionales: `RUTA` del dump y, opcional, `NOMBRE_DB`.
@@ -464,6 +503,7 @@ MYSQL_IMPORT_PASSWORD=secreto
 MYSQL_IMPORT_CHARSET=utf8mb4
 MYSQL_IMPORT_COLLATION=utf8mb4_unicode_ci
 MYSQL_IMPORT_CLIENT=mariadb         # binario cliente en modo native
+MYSQL_IMPORT_MAX_PACKET=1G          # max_allowed_packet al importar
 ```
 
 Las opciones de línea de comandos siempre ganan sobre la config y el entorno.
@@ -520,6 +560,14 @@ mysql-import --mode native --host db.interno.lan -u ro --list
 - El password se pasa como variable de entorno `MYSQL_PWD` al cliente, no en la
   línea de comandos (evita el warning y que se vea en `ps`).
 - No hace backup previo de la base destino. Usá `--drop` a conciencia.
+- **INSERTs grandes:** antes de importar sube `max_allowed_packet` del servidor
+  (`SET GLOBAL`, dura hasta que se reinicie) y del cliente a `--max-packet` (def. `1G`).
+  Evita el `ERROR 2006: MySQL server has gone away` con dumps que traen líneas de
+  varios MB (MySQL 5.7 trae 4M por defecto). Requiere privilegio `SUPER` (root lo tiene);
+  si no, avisa y sigue. También sube `net_read_timeout`/`net_write_timeout` a
+  `MYSQL_IMPORT_NET_TIMEOUT` (def. `3600` s) para que no corte por timeout.
+  Para dejarlo fijo en un contenedor:
+  `docker run ... mysql:5.7 --max-allowed-packet=1G --net-read-timeout=3600 --net-write-timeout=3600`.
 
 ## Desinstalar
 
